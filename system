@@ -1,0 +1,209 @@
+# Smart Contract (smart_contract.py)
+from pyteal import *
+
+def approval_program():
+    # Khai báo các key cho state storage
+    ROOM_PRICE_KEY = Bytes("room_price")
+    ROOM_AVAILABLE_KEY = Bytes("room_available")
+    BOOKING_STATUS_KEY = Bytes("booking_status")
+    HOTEL_OWNER_KEY = Bytes("hotel_owner")
+    
+    # Các operation
+    OP_INITIALIZE = Bytes("initialize")
+    OP_BOOK_ROOM = Bytes("book_room")
+    OP_CANCEL_BOOKING = Bytes("cancel_booking")
+    OP_CHECK_IN = Bytes("check_in")
+    OP_CHECK_OUT = Bytes("check_out")
+    
+    # Handle each operation
+    handle_initialize = Seq([
+        Assert(Txn.application_args.length() == 4),
+        App.globalPut(HOTEL_OWNER_KEY, Txn.sender()),
+        App.globalPut(ROOM_PRICE_KEY, Btoi(Txn.application_args[1])),
+        App.globalPut(ROOM_AVAILABLE_KEY, Btoi(Txn.application_args[2])),
+        Return(Int(1))
+    ])
+    
+    handle_book_room = Seq([
+        Assert(Txn.application_args.length() == 3),
+        Assert(App.globalGet(ROOM_AVAILABLE_KEY) > Int(0)),
+        Assert(Txn.amount() >= App.globalGet(ROOM_PRICE_KEY)),
+        App.globalPut(ROOM_AVAILABLE_KEY, App.globalGet(ROOM_AVAILABLE_KEY) - Int(1)),
+        App.localPut(Txn.sender(), BOOKING_STATUS_KEY, Int(1)),
+        Return(Int(1))
+    ])
+    
+    handle_cancel_booking = Seq([
+        Assert(App.localGet(Txn.sender(), BOOKING_STATUS_KEY) == Int(1)),
+        App.globalPut(ROOM_AVAILABLE_KEY, App.globalGet(ROOM_AVAILABLE_KEY) + Int(1)),
+        App.localPut(Txn.sender(), BOOKING_STATUS_KEY, Int(0)),
+        Return(Int(1))
+    ])
+    
+    handle_check_in = Seq([
+        Assert(App.localGet(Txn.sender(), BOOKING_STATUS_KEY) == Int(1)),
+        App.localPut(Txn.sender(), BOOKING_STATUS_KEY, Int(2)),
+        Return(Int(1))
+    ])
+    
+    handle_check_out = Seq([
+        Assert(App.localGet(Txn.sender(), BOOKING_STATUS_KEY) == Int(2)),
+        App.localPut(Txn.sender(), BOOKING_STATUS_KEY, Int(0)),
+        App.globalPut(ROOM_AVAILABLE_KEY, App.globalGet(ROOM_AVAILABLE_KEY) + Int(1)),
+        Return(Int(1))
+    ])
+    
+    program = Cond(
+        [Txn.application_id() == Int(0), handle_initialize],
+        [Txn.on_completion() == OnComplete.OptIn, Return(Int(1))],
+        [Txn.on_completion() == OnComplete.CloseOut, Return(Int(1))],
+        [Txn.on_completion() == OnComplete.UpdateApplication, Return(Int(0))],
+        [Txn.on_completion() == OnComplete.DeleteApplication, Return(Int(0))],
+        [Txn.application_args[0] == OP_BOOK_ROOM, handle_book_room],
+        [Txn.application_args[0] == OP_CANCEL_BOOKING, handle_cancel_booking],
+        [Txn.application_args[0] == OP_CHECK_IN, handle_check_in],
+        [Txn.application_args[0] == OP_CHECK_OUT, handle_check_out]
+    )
+    
+    return program
+
+def clear_state_program():
+    return Return(Int(1))
+
+# Compile to TEAL
+if __name__ == "__main__":
+    with open("approval.teal", "w") as f:
+        compiled = compileTeal(approval_program(), Mode.Application, version=6)
+        f.write(compiled)
+    
+    with open("clear.teal", "w") as f:
+        compiled = compileTeal(clear_state_program(), Mode.Application, version=6)
+        f.write(compiled)
+
+# Backend API (app.py)
+from flask import Flask, request, jsonify
+from algosdk import account, mnemonic
+from algosdk.v2client import algod
+from algosdk.future.transaction import *
+import json
+import base64
+
+app = Flask(__name__)
+
+# Algorand node configuration
+algod_address = "https://testnet-api.algoexplorer.io"
+algod_token = ""
+algod_client = algod.AlgodClient(algod_token, algod_address)
+
+# Contract configuration
+APP_ID = None  # Replace with your deployed app ID
+HOTEL_OWNER_ADDRESS = None  # Replace with hotel owner address
+HOTEL_OWNER_PRIVATE_KEY = None  # Replace with hotel owner private key
+
+@app.route('/api/initialize', methods=['POST'])
+def initialize_hotel():
+    try:
+        data = request.json
+        room_price = data['roomPrice']
+        total_rooms = data['totalRooms']
+        
+        # Create transaction
+        params = algod_client.suggested_params()
+        txn = ApplicationCreateTxn(
+            sender=HOTEL_OWNER_ADDRESS,
+            sp=params,
+            on_complete=OnComplete.NoOpOC,
+            approval_program=open("approval.teal").read(),
+            clear_program=open("clear.teal").read(),
+            global_schema=StateSchema(num_uints=2, num_byte_slices=1),
+            local_schema=StateSchema(num_uints=1, num_byte_slices=0),
+            app_args=[b"initialize", room_price.to_bytes(8, 'big'), total_rooms.to_bytes(8, 'big')]
+        )
+        
+        # Sign and send transaction
+        signed_txn = txn.sign(HOTEL_OWNER_PRIVATE_KEY)
+        tx_id = algod_client.send_transaction(signed_txn)
+        
+        # Wait for confirmation
+        wait_for_confirmation(algod_client, tx_id)
+        
+        return jsonify({"success": True, "txId": tx_id})
+    
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/api/book-room', methods=['POST'])
+def book_room():
+    try:
+        data = request.json
+        user_address = data['userAddress']
+        user_private_key = data['userPrivateKey']
+        check_in_date = data['checkInDate']
+        check_out_date = data['checkOutDate']
+        
+        # Create opt-in transaction if needed
+        params = algod_client.suggested_params()
+        opt_in_txn = ApplicationOptInTxn(
+            sender=user_address,
+            sp=params,
+            index=APP_ID
+        )
+        
+        # Create booking transaction
+        booking_txn = ApplicationNoOpTxn(
+            sender=user_address,
+            sp=params,
+            index=APP_ID,
+            app_args=[b"book_room", check_in_date.encode(), check_out_date.encode()]
+        )
+        
+        # Group transactions
+        gid = calculate_group_id([opt_in_txn, booking_txn])
+        opt_in_txn.group = gid
+        booking_txn.group = gid
+        
+        # Sign transactions
+        signed_opt_in = opt_in_txn.sign(user_private_key)
+        signed_booking = booking_txn.sign(user_private_key)
+        
+        # Send transactions
+        tx_id = algod_client.send_transactions([signed_opt_in, signed_booking])
+        
+        # Wait for confirmation
+        wait_for_confirmation(algod_client, tx_id)
+        
+        return jsonify({"success": True, "txId": tx_id})
+    
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/api/cancel-booking', methods=['POST'])
+def cancel_booking():
+    try:
+        data = request.json
+        user_address = data['userAddress']
+        user_private_key = data['userPrivateKey']
+        
+        # Create cancel transaction
+        params = algod_client.suggested_params()
+        txn = ApplicationNoOpTxn(
+            sender=user_address,
+            sp=params,
+            index=APP_ID,
+            app_args=[b"cancel_booking"]
+        )
+        
+        # Sign and send transaction
+        signed_txn = txn.sign(user_private_key)
+        tx_id = algod_client.send_transaction(signed_txn)
+        
+        # Wait for confirmation
+        wait_for_confirmation(algod_client, tx_id)
+        
+        return jsonify({"success": True, "txId": tx_id})
+    
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+if __name__ == '__main__':
+    app.run(debug=True)
