@@ -6,4 +6,11 @@ book_room: Để khách hàng đặt phòng.
 check_out: Để khách hàng trả phòng.
 
 Chương trình chính sử dụng Cond để xử lý các hoạt động khác nhau dựa trên đối số ứng dụng.
-Chúng ta cũng có một chương trình clear_state đơn giản.# Algorand-VN-Hackathon
+
+Để triển khai ứng dụng này lên Algorand, bạn cần thực hiện các bước sau:
+
+Cài đặt các thư viện cần thiết:
+Copypip install pyteal py-algorand-sdk
+
+Chạy script Python để tạo các file TEAL:
+Copypython your_script_name.py
